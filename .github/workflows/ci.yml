@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # manual retry when GitHub glitches (startup_failure runs cannot be rerun)
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-pw
+          MYSQL_DATABASE: whalesonar
+        ports: ["23306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-root-pw"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      MYSQL_DSN: root:ci-root-pw@tcp(127.0.0.1:23306)/whalesonar?parseTime=true&charset=utf8mb4
+      TEST_MYSQL_DSN: root:ci-root-pw@tcp(127.0.0.1:23306)/whalesonar?parseTime=true&charset=utf8mb4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: gofmt gate
+        run: |
+          bad=$(gofmt -l .)
+          if [ -n "$bad" ]; then echo "unformatted:"; echo "$bad"; exit 1; fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # staticcheck.conf repo-root config governs exclusions (SA5008 off for
+      # go-zero's custom json tag options).
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      # serialize schema setup first: package tests share one DB and each
+      # ensures migrations — concurrent MigrateUp on a cold schema is a race
+      - name: initdb
+        run: go run ./scripts/initdb -admin 'root:ci-root-pw@tcp(127.0.0.1:23306)/'
+
+      # MYSQL_DSN set -> users/alert/store integration tests run against the real
+      # MySQL 8 service (migrations included); unset elsewhere they self-skip.
+      - name: test (unit + MySQL integration)
+        run: go test -timeout 10m ./...
